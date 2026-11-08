@@ -9,6 +9,15 @@ if(APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
     set(CMAKE_OSX_DEPLOYMENT_TARGET "11.0" CACHE STRING "Minimum macOS version")
 endif()
 
+# Default the app to a universal binary on macOS. Every dependency has to be
+# universal as well, since the install step copies them into Contents/Frameworks
+# and re-signs them; Homebrew bottles are single-arch, so use the vcpkg triplet
+# in platform/macos/triplets/universal-osx.cmake to build them. Override with
+# -DCMAKE_OSX_ARCHITECTURES=<arch> for a single-arch build.
+if(APPLE AND NOT CMAKE_OSX_ARCHITECTURES)
+    set(CMAKE_OSX_ARCHITECTURES "arm64;x86_64" CACHE STRING "macOS architectures")
+endif()
+
 project(freegemas_project)
 
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")

@@ -77,21 +77,70 @@ jobs:
   MacOS:
     runs-on: macos-15
 
+    env:
+      # Homebrew bottles are single-arch, so a universal bundle has to link
+      # against universal dependencies built from source by vcpkg. They are
+      # installed into the workspace rather than a system prefix so the whole
+      # dependency set can be cached and thrown away with the job.
+      VCPKG_INSTALLED: ${{ github.workspace }}/vcpkg-deps
+      VCPKG_CACHE_DIR: ${{ github.workspace }}/vcpkg-cache
+      VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}/vcpkg-cache,readwrite
+
     steps:
-      - name: install dependencies
-        run: |
-          brew install sdl2 sdl2-compat sdl3 sdl2_mixer sdl2_ttf sdl2_image jsoncpp
       - name: checkout
         uses: actions/checkout@v4
+
+      - name: install pkg-config
+        run: brew install pkg-config
+
+      - name: bootstrap vcpkg
+        run: |
+          git clone --depth 1 https://github.com/microsoft/vcpkg.git "$RUNNER_TEMP/vcpkg"
+          "$RUNNER_TEMP/vcpkg/bootstrap-vcpkg.sh" -disableMetrics
+          echo "VCPKG_ROOT=$RUNNER_TEMP/vcpkg" >> "$GITHUB_ENV"
+
+      - name: restore dependency build cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.VCPKG_CACHE_DIR }}
+          key: vcpkg-${{ runner.os }}-universal-${{ hashFiles('platform/macos/triplets/universal-osx.cmake') }}
+
+      - name: install universal dependencies
+        run: |
+          "$VCPKG_ROOT/vcpkg" install \
+            --triplet universal-osx \
+            --overlay-triplets "$GITHUB_WORKSPACE/platform/macos/triplets" \
+            --x-install-root "$VCPKG_INSTALLED" \
+            --clean-after-build \
+            sdl2 sdl2-image sdl2-mixer sdl2-ttf jsoncpp
       - name: build
         run: |
-          export CPATH=$(brew --prefix)/include
-          export LIBRARY_PATH=$(brew --prefix)/lib
-          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/dist"
-          cmake --build build
+          # CMakeLists.txt discovers everything through pkg-config, and the
+          # vcpkg-installed .pc files carry the (relocated) install prefix.
+          export PKG_CONFIG_PATH="$VCPKG_INSTALLED/universal-osx/lib/pkgconfig"
+          export CMAKE_PREFIX_PATH="$VCPKG_INSTALLED/universal-osx"
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/dist" \
+            -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0
+          cmake --build build --parallel
           strip build/freegemas.app/Contents/MacOS/freegemas
-          make -C build install
-          echo "MACOS_ARCH=$(uname -m)" >> "$GITHUB_ENV"
+          cmake --install build
+      - name: verify universal
+        run: |
+          # Fail here rather than shipping a single-arch app plus bundle.
+          BIN=dist/freegemas.app/Contents/MacOS/freegemas
+          lipo -info "$BIN"
+          lipo -info "$BIN" | grep -q x86_64
+          lipo -info "$BIN" | grep -q arm64
+          status=0
+          for lib in dist/freegemas.app/Contents/Frameworks/*.dylib; do
+            lipo -info "$lib"
+            lipo -info "$lib" | grep -q x86_64 || { echo "::error::$lib is missing x86_64"; status=1; }
+            lipo -info "$lib" | grep -q arm64 || { echo "::error::$lib is missing arm64"; status=1; }
+          done
+          exit $status
       - name: package
         run: |
           # upload-artifact uses the least common ancestor of the listed paths as
@@ -99,14 +148,14 @@ jobs:
           # README.md therefore makes the workspace the root and leaves a stray
           # dist/ wrapper in every download. Staging the files side by side keeps
           # the extracted archive flat: freegemas.app, LICENSE, README.md.
-          mkdir -p ${{ env.MACOS_ARCH }}
-          cp -R dist/freegemas.app ${{ env.MACOS_ARCH }}/
-          cp LICENSE README.md ${{ env.MACOS_ARCH }}/
+          mkdir -p macos
+          cp -R dist/freegemas.app macos/
+          cp LICENSE README.md macos/
       - name: publish artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: freegemas-macos-${{ env.MACOS_ARCH }}
-          path: ${{ env.MACOS_ARCH }}/
+          name: freegemas-macos-universal
+          path: macos/
           if-no-files-found: error
 
   Vita:
@@ -130,30 +179,56 @@ jobs:
             README.md
 
   Release:
+    # `always()` makes the release ignore the outcome of the build jobs: it
+    # publishes whatever artifacts exist instead of failing because one platform
+    # (typically Vita or Windows on a fork) is broken. It is still kept in
+    # `needs:` so it *waits* for the builds; removing `needs:` would let it start
+    # concurrently with them and race the artifact uploads, producing an empty
+    # release.
     needs: [Linux, Windows, Vita, MacOS]
-    if: startsWith(github.ref, 'refs/tags/')
+    if: always() && startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     strategy:
       matrix:
         build: [linux, windows, vita, macos]
+      # One platform having no artifact must not stop the others publishing.
+      fail-fast: false
     steps:
     - name: Extract tag name
       id: tag
-      run: echo ::set-output name=VERSION::${GITHUB_REF/refs\/tags\//}
+      run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
     - uses: actions/download-artifact@v4
+      with:
+        path: artifacts
     - name: Zip artifacts
       run: |
+        set -euo pipefail
+        cd artifacts
         if [ "${{ matrix.build }}" = "macos" ]; then
+          # The macOS artifact is the universal bundle now, but older runs may
+          # still carry per-arch names, so match the prefix.
+          shopt -s nullglob
+          zips=()
           for artifact in freegemas-macos-*; do
-            [ -d "$artifact" ] && zip -r "${artifact}.zip" "$artifact"
+            [ -d "$artifact" ] || continue
+            zip -r "${artifact}.zip" "$artifact"
+            zips+=("${artifact}.zip")
           done
+          if [ ${#zips[@]} -eq 0 ]; then
+            echo "::warning::no freegemas-macos-* artifact, nothing to release"
+            exit 0
+          fi
         else
-          zip -r freegemas-${{matrix.build}}.zip freegemas-${{matrix.build}}
+          if [ ! -d "freegemas-${{ matrix.build }}" ]; then
+            echo "::warning::no freegemas-${{ matrix.build }} artifact, nothing to release"
+            exit 0
+          fi
+          zip -r "freegemas-${{ matrix.build }}.zip" "freegemas-${{ matrix.build }}"
         fi
     - name: Release
-      uses: softprops/action-gh-release@v1
+      uses: softprops/action-gh-release@v2
       with:
-        files: freegemas-${{matrix.build}}*.zip
+        files: artifacts/freegemas-${{ matrix.build }}*.zip
         tag_name: ${{ steps.tag.outputs.VERSION }}
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
