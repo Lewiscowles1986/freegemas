@@ -51,14 +51,21 @@ jobs:
             mingw-w64-x86_64-make
             mingw-w64-x86_64-cmake
             mingw-w64-x86_64-pkgconf
-            mingw-w64-x86_64-SDL2
-            mingw-w64-x86_64-SDL2_image
-            mingw-w64-x86_64-SDL2_mixer
-            mingw-w64-x86_64-SDL2_ttf
             mingw-w64-x86_64-jsoncpp
           update: true
       - name: Checkout
         uses: actions/checkout@v4
+      # MSYS2 replaced mingw-w64-x86_64-SDL2 with mingw-w64-x86_64-sdl2-compat,
+      # which ships only libSDL2.dll.a. The static link below needs libSDL2.a,
+      # so pin the last SDL2 release that provides it. Remove this step once
+      # mingw-w64-x86_64-sdl2-compat ships a static library.
+      - name: Install pinned static SDL2
+        run: |
+          pacman -U --noconfirm \
+            https://repo.msys2.org/mingw/mingw64/mingw-w64-x86_64-SDL2-2.32.10-1-any.pkg.tar.zst \
+            https://repo.msys2.org/mingw/mingw64/mingw-w64-x86_64-SDL2_image-2.8.12-1-any.pkg.tar.zst \
+            https://repo.msys2.org/mingw/mingw64/mingw-w64-x86_64-SDL2_mixer-2.8.2-1-any.pkg.tar.zst \
+            https://repo.msys2.org/mingw/mingw64/mingw-w64-x86_64-SDL2_ttf-2.24.0-1-any.pkg.tar.zst
       - name: Build
         run: |
           cmake -DCMAKE_BUILD_TYPE=Release -G "MinGW Makefiles" .
